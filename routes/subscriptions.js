@@ -3,6 +3,11 @@ const crypto = require('crypto');
 const SubscriptionPlan = require('../models/SubscriptionPlan');
 const User = require('../models/User');
 const { protect, adminOnly } = require('../middleware/auth');
+const { 
+  sendSubscriptionSuccessEmail, 
+  sendSubscriptionCancelledEmail,
+  sendPaymentFailedEmail 
+} = require('../utils/email');
 
 const router = express.Router();
 
@@ -233,14 +238,36 @@ router.post('/verify-payment', protect, async (req, res) => {
 
     await user.save();
 
+    // Send success email
+    try {
+      await sendSubscriptionSuccessEmail(user, user.subscription);
+      console.log('✅ Subscription success email sent');
+    } catch (emailError) {
+      console.error('❌ Failed to send subscription email:', emailError.message);
+    }
+
     res.json({
       success: true,
-      message: 'Subscription activated successfully',
+      message: 'Subscription activated successfully!',
       subscription: user.subscription
     });
   } catch (error) {
-    console.error('Error verifying payment:', error);
-    res.status(500).json({ message: 'Server error verifying payment' });
+    console.error('Payment verification error:', error);
+    
+    // Send payment failed email
+    try {
+      const plan = await SubscriptionPlan.findById(req.body.planId);
+      if (plan) {
+        await sendPaymentFailedEmail(user, plan.name, plan.price);
+      }
+    } catch (emailError) {
+      console.error('Failed to send payment failed email:', emailError.message);
+    }
+    
+    res.status(500).json({ 
+      success: false,
+      message: 'Payment verification failed' 
+    });
   }
 });
 
@@ -313,24 +340,24 @@ router.post('/cancel', protect, async (req, res) => {
 
     await user.save();
 
-    // Log cancellation
-    console.log(`Subscription cancelled for user ${user._id} - Plan: ${user.subscription.planId?.name}`);
+    // Send cancellation email
+    try {
+      await sendSubscriptionCancelledEmail(user, user.subscription.endDate);
+      console.log('✅ Cancellation email sent');
+    } catch (emailError) {
+      console.error('❌ Failed to send cancellation email:', emailError.message);
+    }
 
     res.json({
       success: true,
-      message: 'Subscription cancelled successfully. You can continue using the service until your current billing period ends.',
-      subscription: {
-        status: user.subscription.status,
-        endDate: user.subscription.endDate,
-        planName: user.subscription.planId?.name,
-        accessUntil: user.subscription.endDate
-      }
+      message: 'Subscription cancelled successfully. You can continue using the service until the end of your billing period.',
+      endDate: user.subscription.endDate
     });
   } catch (error) {
-    console.error('Error cancelling subscription:', error);
+    console.error('Cancel subscription error:', error);
     res.status(500).json({ 
       success: false,
-      message: 'Server error while cancelling subscription' 
+      message: 'Server error' 
     });
   }
 });

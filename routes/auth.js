@@ -2,7 +2,10 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const User = require('../models/User');
-const { sendEmail } = require('../utils/email');
+const { 
+  sendWelcomeEmail, 
+  sendPasswordResetEmail 
+} = require('../utils/email');
 const crypto = require('crypto');
 
 const router = express.Router();
@@ -53,18 +56,13 @@ router.post('/register', [
     await user.save();
 
     // Send verification email
-    const verificationUrl = `${process.env.CLIENT_URL}/verify-email/${emailVerificationToken}`;
-    
-    await sendEmail({
-      to: user.email,
-      subject: 'Email Verification - StreamFlix',
-      html: `
-        <h1>Welcome to StreamFlix!</h1>
-        <p>Please click the link below to verify your email:</p>
-        <a href="${verificationUrl}" style="background: #e50914; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Verify Email</a>
-        ${isFirstUser ? '<p><strong>Note: You have been granted admin privileges as the first user.</strong></p>' : ''}
-      `
-    });
+    try {
+      await sendWelcomeEmail(user, emailVerificationToken);
+      console.log('✅ Welcome email sent to:', user.email);
+    } catch (emailError) {
+      console.error('❌ Failed to send welcome email:', emailError.message);
+      // Don't fail registration if email fails
+    }
 
     const token = generateToken(user._id);
 
@@ -78,10 +76,11 @@ router.post('/register', [
         role: user.role,
         isEmailVerified: user.isEmailVerified,
         profiles: user.profiles
-      }
+      },
+      message: isFirstUser ? 'Admin account created successfully!' : 'Registration successful! Please check your email for verification.'
     });
   } catch (error) {
-    console.error(error);
+    console.error('Registration error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -174,22 +173,24 @@ router.post('/forgot-password', [
 
     await user.save();
 
-    const resetUrl = `${process.env.CLIENT_URL}/reset-password/${resetToken}`;
-    
-    await sendEmail({
-      to: user.email,
-      subject: 'Password Reset - StreamFlix',
-      html: `
-        <h1>Password Reset</h1>
-        <p>You requested a password reset. Click the link below to reset your password:</p>
-        <a href="${resetUrl}" style="background: #e50914; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Reset Password</a>
-        <p>This link will expire in 10 minutes.</p>
-      `
-    });
+    try {
+      await sendPasswordResetEmail(user, resetToken);
+      console.log('✅ Password reset email sent to:', user.email);
+    } catch (emailError) {
+      console.error('❌ Failed to send password reset email:', emailError.message);
+      // Rollback the token if email fails
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpire = undefined;
+      await user.save();
+      return res.status(500).json({ message: 'Failed to send password reset email. Please try again.' });
+    }
 
-    res.json({ message: 'Password reset email sent' });
+    res.json({ 
+      success: true,
+      message: 'Password reset email sent successfully' 
+    });
   } catch (error) {
-    console.error(error);
+    console.error('Forgot password error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
