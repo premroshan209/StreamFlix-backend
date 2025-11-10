@@ -7,7 +7,27 @@ const { protect, adminOnly } = require('../middleware/auth');
 
 const router = express.Router();
 
-const upload = multer({ dest: 'uploads/' });
+// ✅ Use memory storage for serverless (no disk writes)
+const storage = multer.memoryStorage();
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 100 * 1024 * 1024 // 100MB limit for Vercel
+  }
+});
+
+// Helper function to upload from buffer
+const uploadFromBuffer = async (buffer, mimetype, folder, resourceType = 'auto') => {
+  const b64 = Buffer.from(buffer).toString('base64');
+  const dataURI = `data:${mimetype};base64,${b64}`;
+  
+  return await cloudinary.uploader.upload(dataURI, {
+    folder,
+    resource_type: resourceType,
+    chunk_size: 6000000, // 6MB chunks for large files
+    timeout: 120000 // 2 minute timeout
+  });
+};
 
 // Middleware to check subscription
 const checkSubscription = async (req, res, next) => {
@@ -228,26 +248,23 @@ router.get('/:id', protect, async (req, res) => {
 });
 
 // @route   POST /api/videos/upload
-// @desc    Upload new video (movie or series with episodes)
+// @desc    Upload new video
 // @access  Admin
 router.post('/upload', protect, adminOnly, upload.fields([
   { name: 'video', maxCount: 1 },
   { name: 'thumbnail', maxCount: 1 },
   { name: 'trailer', maxCount: 1 },
-  { name: 'episodes', maxCount: 50 } // Support multiple episode files
+  { name: 'episodes', maxCount: 50 }
 ]), async (req, res) => {
-  let videoResult, thumbnailResult, trailerResult;
-  let episodeResults = [];
-  
   try {
     console.log('Upload request received');
     console.log('Body:', req.body);
-    console.log('Files:', req.files);
+    console.log('Files:', Object.keys(req.files || {}));
 
     const {
       title, description, genre, type, releaseYear, duration,
       rating, imdbRating, cast, director, producer, language, subtitles, tags,
-      seasonNumber, episodeData // For series
+      seasonNumber, episodeData
     } = req.body;
 
     // Validate required fields
@@ -271,63 +288,68 @@ router.post('/upload', protect, adminOnly, upload.fields([
 
     console.log('Starting file uploads to Cloudinary...');
 
-    // Upload main video (for movies) or first episode (for series)
+    let videoResult, thumbnailResult, trailerResult;
+    let episodeResults = [];
+
+    // Upload main video (for movies)
     if (req.files.video && req.files.video[0]) {
-      videoResult = await cloudinary.uploader.upload(req.files.video[0].path, {
-        resource_type: 'video',
-        folder: 'streamflix/videos',
-        use_filename: true,
-        unique_filename: false
-      });
-      console.log('Main video uploaded to Cloudinary:', videoResult.public_id);
+      console.log('Uploading main video...');
+      videoResult = await uploadFromBuffer(
+        req.files.video[0].buffer,
+        req.files.video[0].mimetype,
+        'streamflix/videos',
+        'video'
+      );
+      console.log('Main video uploaded:', videoResult.public_id);
     }
 
     // Upload thumbnail
-    thumbnailResult = await cloudinary.uploader.upload(req.files.thumbnail[0].path, {
-      folder: 'streamflix/thumbnails',
-      use_filename: true,
-      unique_filename: false
-    });
-    console.log('Thumbnail uploaded to Cloudinary:', thumbnailResult.public_id);
+    console.log('Uploading thumbnail...');
+    thumbnailResult = await uploadFromBuffer(
+      req.files.thumbnail[0].buffer,
+      req.files.thumbnail[0].mimetype,
+      'streamflix/thumbnails',
+      'image'
+    );
+    console.log('Thumbnail uploaded:', thumbnailResult.public_id);
 
     // Upload trailer if provided
     let trailerData = {};
     if (req.files.trailer && req.files.trailer[0]) {
-      trailerResult = await cloudinary.uploader.upload(req.files.trailer[0].path, {
-        resource_type: 'video',
-        folder: 'streamflix/trailers',
-        use_filename: true,
-        unique_filename: false
-      });
+      console.log('Uploading trailer...');
+      trailerResult = await uploadFromBuffer(
+        req.files.trailer[0].buffer,
+        req.files.trailer[0].mimetype,
+        'streamflix/trailers',
+        'video'
+      );
       trailerData = {
         url: trailerResult.secure_url,
         cloudinaryId: trailerResult.public_id
       };
-      console.log('Trailer uploaded to Cloudinary:', trailerResult.public_id);
+      console.log('Trailer uploaded:', trailerResult.public_id);
     }
 
     // Handle series episodes
     let seasonsData = [];
     if (type === 'series' && req.files.episodes) {
+      console.log('Uploading episodes...');
       const episodes = req.files.episodes;
       const parsedEpisodeData = JSON.parse(episodeData);
       
       for (let i = 0; i < episodes.length; i++) {
-        const episodeFile = episodes[i];
-        const episodeInfo = parsedEpisodeData[i];
-        
-        const episodeResult = await cloudinary.uploader.upload(episodeFile.path, {
-          resource_type: 'video',
-          folder: `streamflix/series/${title}/season${seasonNumber || 1}`,
-          use_filename: true,
-          unique_filename: false
-        });
+        console.log(`Uploading episode ${i + 1}/${episodes.length}...`);
+        const episodeResult = await uploadFromBuffer(
+          episodes[i].buffer,
+          episodes[i].mimetype,
+          `streamflix/series/${title}/season${seasonNumber || 1}`,
+          'video'
+        );
         
         episodeResults.push(episodeResult);
-        console.log(`Episode ${i + 1} uploaded to Cloudinary:`, episodeResult.public_id);
+        console.log(`Episode ${i + 1} uploaded:`, episodeResult.public_id);
       }
       
-      // Organize episodes into seasons
       seasonsData = [{
         seasonNumber: parseInt(seasonNumber) || 1,
         title: `Season ${seasonNumber || 1}`,
@@ -339,14 +361,14 @@ router.post('/upload', protect, adminOnly, upload.fields([
           duration: parsedEpisodeData[index]?.duration || 45,
           videoUrl: result.secure_url,
           cloudinaryId: result.public_id,
-          thumbnail: thumbnailResult.secure_url, // Use main thumbnail for episodes
+          thumbnail: thumbnailResult.secure_url,
           airDate: new Date(),
           views: 0
         }))
       }];
     }
 
-    // Parse other JSON fields safely
+    // Parse JSON fields
     let parsedGenre = [];
     if (genre) {
       try {
@@ -362,17 +384,6 @@ router.post('/upload', protect, adminOnly, upload.fields([
         parsedCast = typeof cast === 'string' ? JSON.parse(cast) : Array.isArray(cast) ? cast : [];
       } catch (error) {
         console.log('Cast parsing error, skipping:', error);
-        parsedCast = [];
-      }
-    }
-
-    let parsedSubtitles = [];
-    if (subtitles) {
-      try {
-        parsedSubtitles = typeof subtitles === 'string' ? JSON.parse(subtitles) : Array.isArray(subtitles) ? subtitles : [];
-      } catch (error) {
-        console.log('Subtitles parsing error, skipping:', error);
-        parsedSubtitles = [];
       }
     }
 
@@ -381,7 +392,6 @@ router.post('/upload', protect, adminOnly, upload.fields([
       try {
         parsedTags = typeof tags === 'string' ? JSON.parse(tags) : Array.isArray(tags) ? tags : [];
       } catch (error) {
-        console.log('Tags parsing error, treating as string:', error);
         parsedTags = typeof tags === 'string' ? tags.split(',').map(t => t.trim()) : [];
       }
     }
@@ -418,6 +428,8 @@ router.post('/upload', protect, adminOnly, upload.fields([
     if (director) videoData.director = director;
     if (producer) videoData.producer = producer;
     if (Object.keys(trailerData).length > 0) videoData.trailer = trailerData;
+    if (parsedCast.length > 0) videoData.cast = parsedCast;
+    if (parsedTags.length > 0) videoData.tags = parsedTags;
 
     const video = new Video(videoData);
     await video.save();
@@ -437,27 +449,6 @@ router.post('/upload', protect, adminOnly, upload.fields([
     });
   } catch (error) {
     console.error('Video upload error:', error);
-    
-    // Clean up uploaded files if database save fails
-    try {
-      if (videoResult?.public_id) {
-        await cloudinary.uploader.destroy(videoResult.public_id, { resource_type: 'video' });
-      }
-      if (thumbnailResult?.public_id) {
-        await cloudinary.uploader.destroy(thumbnailResult.public_id);
-      }
-      if (trailerResult?.public_id) {
-        await cloudinary.uploader.destroy(trailerResult.public_id, { resource_type: 'video' });
-      }
-      // Clean up episode files
-      for (const episodeResult of episodeResults) {
-        if (episodeResult?.public_id) {
-          await cloudinary.uploader.destroy(episodeResult.public_id, { resource_type: 'video' });
-        }
-      }
-    } catch (cleanupError) {
-      console.error('Error cleaning up files:', cleanupError);
-    }
     
     res.status(500).json({ 
       success: false,

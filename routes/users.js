@@ -6,7 +6,15 @@ const { cloudinary } = require('../utils/cloudinary');
 const multer = require('multer');
 
 const router = express.Router();
-const upload = multer({ dest: 'uploads/' });
+
+// ✅ Use memory storage for serverless (no disk writes)
+const storage = multer.memoryStorage();
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  }
+});
 
 // @route   GET /api/users/me
 // @desc    Get current user
@@ -95,10 +103,16 @@ router.put('/profile/:profileId', protect, upload.single('avatar'), async (req, 
     if (name) profile.name = name;
     if (preferences) profile.preferences = JSON.parse(preferences);
 
+    // ✅ Upload directly from memory buffer to Cloudinary
     if (req.file) {
-      const result = await cloudinary.uploader.upload(req.file.path, {
-        folder: 'streamflix/avatars'
+      const b64 = Buffer.from(req.file.buffer).toString('base64');
+      const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+      
+      const result = await cloudinary.uploader.upload(dataURI, {
+        folder: 'streamflix/avatars',
+        resource_type: 'auto'
       });
+      
       profile.avatar = result.secure_url;
     }
 
@@ -109,7 +123,7 @@ router.put('/profile/:profileId', protect, upload.single('avatar'), async (req, 
       profile
     });
   } catch (error) {
-    console.error(error);
+    console.error('Profile update error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
