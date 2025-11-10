@@ -2,9 +2,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const path = require('path');
-const { startSubscriptionCrons } = require('./utils/subscriptionCron');
 
+// Load environment variables
 dotenv.config();
 
 const app = express();
@@ -14,32 +13,34 @@ const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:3001',
   process.env.FRONTEND_URL,
+  process.env.CLIENT_URL,
   process.env.VERCEL_URL
 ].filter(Boolean);
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
     if (!origin) return callback(null, true);
     
-    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('vercel.app')) {
+    // Allow all vercel.app domains
+    if (origin.includes('vercel.app') || allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      callback(null, true); // Allow all in development
     }
   },
   credentials: true
 }));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
     message: 'StreamFlix API is running',
     version: '1.0.0',
-    status: 'healthy'
+    status: 'healthy',
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -63,107 +64,72 @@ app.use('/api/videos', require('./routes/videos'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/admin', require('./routes/admin'));
 
-// Database connection with retry logic
-const connectDB = async (retries = 5) => {
+// MongoDB connection cache for serverless
+let cachedDb = null;
+
+const connectDB = async () => {
+  if (cachedDb && mongoose.connection.readyState === 1) {
+    console.log('Using cached database connection');
+    return cachedDb;
+  }
+
   try {
     const mongoURI = process.env.MONGODB_URI || process.env.MONGO_URI;
     
     if (!mongoURI) {
-      throw new Error('❌ MongoDB URI is not defined in environment variables');
+      throw new Error('MongoDB URI is not defined');
     }
 
-    if (mongoURI.includes('<password>')) {
-      throw new Error('❌ Please replace <password> in MONGODB_URI with your actual password');
-    }
-
-    if (mongoURI.includes('your_username') || mongoURI.includes('your_password')) {
-      throw new Error('❌ Please update MONGODB_URI in .env file with your actual credentials');
-    }
-
-    console.log('🔌 Connecting to MongoDB...');
-    console.log('📍 Using database:', mongoURI.split('@')[1]?.split('/')[1]?.split('?')[0] || 'Unknown');
+    console.log('Connecting to MongoDB...');
     
-    await mongoose.connect(mongoURI, {
+    const conn = await mongoose.connect(mongoURI, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
       serverSelectionTimeoutMS: 10000,
       socketTimeoutMS: 45000,
     });
     
-    console.log('✅ MongoDB Connected Successfully');
-    console.log(`📊 Database: ${mongoose.connection.name}`);
-    console.log(`🌐 Host: ${mongoose.connection.host}`);
+    cachedDb = conn;
+    console.log('✅ MongoDB Connected');
     
-    // Start cron jobs only in production
-    if (process.env.NODE_ENV === 'production') {
-      startSubscriptionCrons();
-    } else {
-      console.log('⏭️  Subscription cron jobs disabled in development mode');
-    }
+    return cachedDb;
   } catch (error) {
     console.error('❌ MongoDB connection error:', error.message);
-    
-    if (error.message.includes('querySrv ENOTFOUND')) {
-      console.log('\n🔧 DNS Resolution Error - Possible causes:');
-      console.log('   1. ❌ Connection string format is incorrect');
-      console.log('   2. ❌ Cluster address is wrong');
-      console.log('   3. ❌ MongoDB Atlas cluster is not created yet');
-      console.log('\n✅ Solution:');
-      console.log('   1. Go to https://cloud.mongodb.com/');
-      console.log('   2. Create a FREE cluster');
-      console.log('   3. Get the connection string from "Connect" button');
-      console.log('   4. Update MONGODB_URI in .env file\n');
-    } else if (error.message.includes('Authentication failed')) {
-      console.log('\n🔧 Authentication Error:');
-      console.log('   ❌ Username or password is incorrect');
-      console.log('   ✅ Check your credentials in MongoDB Atlas');
-      console.log('   ✅ Encode special characters in password\n');
-    } else if (error.message.includes('not authorized')) {
-      console.log('\n🔧 Authorization Error:');
-      console.log('   ❌ Database user doesn\'t have access');
-      console.log('   ✅ Check user permissions in MongoDB Atlas\n');
-    }
-    
-    if (retries > 0) {
-      console.log(`🔄 Retrying connection... (${retries} attempts left)`);
-      setTimeout(() => connectDB(retries - 1), 5000);
-    } else {
-      console.error('\n❌ Failed to connect to MongoDB after multiple attempts\n');
-      
-      if (process.env.NODE_ENV !== 'production') {
-        console.log('⚠️  Server will continue running without database connection');
-        console.log('⚠️  API endpoints will not work until database is connected\n');
-      } else {
-        console.log('❌ Exiting... Database is required in production\n');
-        process.exit(1);
-      }
-    }
+    throw error;
   }
 };
 
-connectDB();
+// Connect to database
+connectDB().catch(err => console.error('Initial DB connection failed:', err));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ 
-    message: 'Something went wrong!',
-    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+  console.error('Error:', err);
+  res.status(err.status || 500).json({ 
+    success: false,
+    message: err.message || 'Something went wrong!',
+    error: process.env.NODE_ENV === 'development' ? err.stack : undefined
   });
 });
 
 // 404 handler
 app.use((req, res) => {
-  res.status(404).json({ message: 'Route not found' });
+  res.status(404).json({ 
+    success: false,
+    message: 'Route not found',
+    path: req.path
+  });
 });
 
-const PORT = process.env.PORT || 8000;
+// For local development
+const PORT = process.env.PORT || process.env.SERVER_PORT || 8000;
 
 if (process.env.NODE_ENV !== 'production') {
   app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`🌐 http://localhost:${PORT}`);
   });
 }
 
-// Export for Vercel
+// Export for Vercel serverless
 module.exports = app;

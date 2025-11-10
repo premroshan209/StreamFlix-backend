@@ -167,13 +167,20 @@ async function sendExpirationNotification(user) {
 
 // Start cron jobs
 function startSubscriptionCrons() {
-  // Only start cron jobs in production
+  // Cron jobs don't work in serverless - use Vercel Cron or external service
+  if (process.env.NODE_ENV === 'production' && process.env.VERCEL) {
+    console.log('⚠️  Cron jobs disabled in serverless environment');
+    console.log('💡 Use Vercel Cron Jobs or external scheduler for production');
+    return;
+  }
+  
+  // Only run in non-serverless production
   if (process.env.NODE_ENV === 'production') {
     subscriptionRenewalCron.start();
     expiredSubscriptionsCron.start();
-    console.log('Subscription cron jobs started');
+    console.log('✅ Subscription cron jobs started');
   } else {
-    console.log('Subscription cron jobs disabled in development mode');
+    console.log('⏭️  Subscription cron jobs disabled in development mode');
   }
 }
 
