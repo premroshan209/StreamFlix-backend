@@ -3,170 +3,111 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 
-// Load environment variables
 dotenv.config();
 
 const app = express();
 
-// Trust proxy (required for Vercel)
+// Trust proxy for Vercel
 app.set('trust proxy', 1);
 
-// CORS configuration for production
+// CORS - Allow Vercel domains
 const allowedOrigins = [
   'http://localhost:3000',
-  'http://localhost:3001',
   process.env.FRONTEND_URL,
-  process.env.CLIENT_URL,
-  process.env.VERCEL_URL
+  process.env.CLIENT_URL
 ].filter(Boolean);
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
     if (!origin) return callback(null, true);
-    
-    // Allow all vercel.app domains
-    if (origin.includes('vercel.app') || origin.includes('localhost')) {
+    if (origin.includes('vercel.app') || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
-    
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      console.log('Blocked origin:', origin);
-      callback(null, true); // Allow in development, block in production if needed
-    }
+    callback(null, true); // Allow in development
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Body parser middleware
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Request logging in development
-if (process.env.NODE_ENV === 'development') {
-  app.use((req, res, next) => {
-    console.log(`${req.method} ${req.path}`);
-    next();
-  });
-}
-
-// Health check endpoint
+// Health check - MUST be synchronous and fast
 app.get('/', (req, res) => {
   res.json({ 
-    message: 'StreamFlix API is running',
+    status: 'ok',
+    message: 'StreamFlix API',
     version: '1.0.0',
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV
+    timestamp: new Date().toISOString()
   });
 });
 
 app.get('/api', (req, res) => {
   res.json({ 
+    status: 'ok',
     message: 'StreamFlix API v1.0',
-    endpoints: {
-      auth: '/api/auth',
-      users: '/api/users',
-      videos: '/api/videos',
-      subscriptions: '/api/subscriptions',
-      admin: '/api/admin'
-    }
+    endpoints: ['/api/auth', '/api/users', '/api/videos', '/api/subscriptions', '/api/admin']
   });
 });
 
-// API Routes
+// MongoDB connection cache for serverless
+let cachedDb = null;
+
+async function connectDB() {
+  if (cachedDb && mongoose.connection.readyState === 1) {
+    return cachedDb;
+  }
+
+  try {
+    const conn = await mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 5000, // Fail fast in serverless
+      socketTimeoutMS: 10000,
+      maxPoolSize: 1, // Minimal connections for serverless
+      minPoolSize: 0
+    });
+    
+    cachedDb = conn;
+    console.log('MongoDB Connected');
+    return cachedDb;
+  } catch (error) {
+    console.error('MongoDB Error:', error.message);
+    throw error;
+  }
+}
+
+// Middleware to ensure DB connection per request
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (error) {
+    res.status(503).json({ 
+      success: false,
+      message: 'Database connection failed' 
+    });
+  }
+});
+
+// Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/videos', require('./routes/videos'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/admin', require('./routes/admin'));
 
-// MongoDB connection cache for serverless
-let cachedDb = null;
-
-const connectDB = async (retries = 3) => {
-  if (cachedDb && mongoose.connection.readyState === 1) {
-    console.log('Using cached database connection');
-    return cachedDb;
-  }
-
-  try {
-    const mongoURI = process.env.MONGODB_URI || process.env.MONGO_URI;
-    
-    if (!mongoURI) {
-      throw new Error('MongoDB URI is not defined in environment variables');
-    }
-
-    console.log('Connecting to MongoDB...');
-    
-    const conn = await mongoose.connect(mongoURI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 10000,
-      socketTimeoutMS: 45000,
-      maxPoolSize: 10,
-    });
-    
-    cachedDb = conn;
-    console.log('✅ MongoDB Connected Successfully');
-    console.log(`📍 Database: ${mongoose.connection.name}`);
-    
-    // Start cron jobs only in non-serverless production
-    if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
-      const { startSubscriptionCrons } = require('./utils/subscriptionCron');
-      startSubscriptionCrons();
-    }
-    
-    return cachedDb;
-  } catch (error) {
-    console.error('❌ MongoDB connection error:', error.message);
-    
-    if (retries > 0) {
-      console.log(`🔄 Retrying connection... (${retries} attempts left)`);
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      return connectDB(retries - 1);
-    }
-    
-    throw error;
-  }
-};
-
-// Connect to database
-connectDB().catch(err => {
-  console.error('Failed to connect to MongoDB:', err);
-  if (process.env.NODE_ENV === 'production') {
-    process.exit(1);
-  }
-});
-
-// Handle MongoDB connection events
-mongoose.connection.on('disconnected', () => {
-  console.log('MongoDB disconnected');
-});
-
-mongoose.connection.on('error', (err) => {
-  console.error('MongoDB error:', err);
-});
-
-// Error handling middleware
+// Error handling
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  
-  const statusCode = err.statusCode || 500;
-  const message = err.message || 'Something went wrong!';
-  
-  res.status(statusCode).json({ 
+  console.error('Error:', err.message);
+  res.status(err.status || 500).json({ 
     success: false,
-    message,
-    error: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    message: err.message || 'Internal server error'
   });
 });
 
-// 404 handler
+// 404
 app.use((req, res) => {
   res.status(404).json({ 
     success: false,
@@ -175,25 +116,13 @@ app.use((req, res) => {
   });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM signal received: closing HTTP server');
-  mongoose.connection.close(() => {
-    console.log('MongoDB connection closed');
-    process.exit(0);
-  });
-});
-
-// For local development
-const PORT = process.env.PORT || process.env.SERVER_PORT || 8000;
-
+// DON'T start server in serverless
+const PORT = process.env.PORT || 8000;
 if (process.env.NODE_ENV !== 'production') {
   app.listen(PORT, () => {
-    console.log(`✅ Server running on port ${PORT}`);
-    console.log(`🌐 http://localhost:${PORT}`);
-    console.log(`📝 Environment: ${process.env.NODE_ENV}`);
+    console.log(`Server running on port ${PORT}`);
   });
 }
 
-// Export for Vercel serverless
+// Export for Vercel
 module.exports = app;
